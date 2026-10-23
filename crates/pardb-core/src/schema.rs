@@ -39,29 +39,44 @@ pub struct Column {
     pub nullable: bool,
 }
 
-/// Defines additional constraints on a table.
+/// Defines a constraint applied to a database table.
 ///
-/// Table constraints describe rules that must be satisfied
-/// by the data stored in a table.
-///
-/// A table may contain multiple constraints, including
-/// single-column and composite uniqueness constraints.
-///
-/// Primary key definitions are managed separately by [`Schema`].
+/// A table constraint may optionally have a name. Constraint names are
+/// scoped to the table that contains them and can be used to identify
+/// constraints in error messages or schema-management operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TableConstraint {
-    /// Requires the specified column values to be unique
-    /// across rows in the table.
-    ///
-    /// A single column identifier defines a single-column
-    /// constraint, while multiple identifiers define a
-    /// composite uniqueness constraint.
-    ///
-    /// The handling of `NULL` values depends on ParDB's
-    /// uniqueness semantics.
-    Unique(Vec<ColumnId>),
+pub struct TableConstraint {
+    /// Name assigned to the constraint.
+    pub name: String,
+
+    /// The kind of rule enforced by the constraint.
+    pub kind: ConstraintKind,
 }
 
+/// Describes the type and columns involved in a table constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintKind {
+    /// Identifies each row uniquely using one or more columns.
+    ///
+    /// A table may have only one primary key. The referenced columns
+    /// must exist in the table and should not allow `NULL` values.
+    PrimaryKey {
+        /// Columns that make up the primary key.
+        ///
+        /// Multiple columns represent a composite primary key.
+        columns: Vec<ColumnId>,
+    },
+
+    /// Prevents duplicate values across one or more columns.
+    ///
+    /// Multiple unique constraints may exist on the same table.
+    Unique {
+        /// Columns whose combined values must be unique.
+        ///
+        /// Multiple columns represent a composite unique constraint.
+        columns: Vec<ColumnId>,
+    },
+}
 /// Describes the logical structure of a database table.
 ///
 /// A schema contains an ordered collection of column definitions
@@ -76,9 +91,6 @@ pub enum TableConstraint {
 pub struct Schema {
     /// Column definitions in their logical order.
     columns: Vec<Column>,
-
-    /// Optional primary key, supporting composite keys.
-    primary_key: Option<Vec<ColumnId>>,
 
     /// Constraints associated with the table.
     constraints: Vec<TableConstraint>,
