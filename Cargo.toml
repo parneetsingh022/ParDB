@@ -3,6 +3,7 @@ resolver = "3"
 
 members = [
     "crates/pardb-core",
+    "crates/pardb-storage",
 ]
 
 [workspace.package]
