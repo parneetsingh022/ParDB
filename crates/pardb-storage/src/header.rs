@@ -14,7 +14,7 @@
 //! byte order when written to disk.
 
 use crate::{
-    errors::PageError,
+    errors::HeaderError,
     page::{PAGE_SIZE, Page, PageId},
 };
 
@@ -54,7 +54,9 @@ pub struct DatabaseHeader {
 }
 
 impl DatabaseHeader {
-    pub fn encode(&self) -> Result<Page, PageError> {
+    pub fn encode(&self) -> Result<Page, HeaderError> {
+        self.validate()?;
+
         let mut page = Page::new();
         page.write(0, &self.magic)?; // bytes 0-3
         page.write(4, &self.version.to_le_bytes())?; // bytes 4-5
@@ -69,7 +71,7 @@ impl DatabaseHeader {
         Ok(page)
     }
 
-    pub fn decode(page: &Page) -> Result<Self, PageError> {
+    pub fn decode(page: &Page) -> Result<Self, HeaderError> {
         // Bytes 0-3: Magic number
         let magic = page.read(0, 4)?.try_into().unwrap();
 
@@ -98,7 +100,39 @@ impl DatabaseHeader {
             catalog_root,
         };
 
+        header.validate()?;
+
         Ok(header)
+    }
+
+    fn validate(&self) -> Result<(), HeaderError> {
+        if self.magic != MAGIC {
+            return Err(HeaderError::InvalidMagic);
+        }
+
+        if self.version != FORMAT_VERSION {
+            return Err(HeaderError::UnsupportedVersion {
+                found: self.version,
+            });
+        }
+
+        if self.page_size != PAGE_SIZE as u16 {
+            return Err(HeaderError::InvalidPageSize {
+                found: self.page_size,
+            });
+        }
+
+        if self.page_count == 0 {
+            return Err(HeaderError::InvalidPageCount);
+        }
+
+        if let Some(root) = self.catalog_root
+            && (root.0 == 0 || root.0 >= self.page_count)
+        {
+            return Err(HeaderError::InvalidCatalogRoot);
+        }
+
+        Ok(())
     }
 }
 
@@ -123,6 +157,13 @@ impl Default for DatabaseHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Creates a valid encoded database header for testing.
+    fn valid_header_page() -> Page {
+        DatabaseHeader::default()
+            .encode()
+            .expect("Default header should encode successfully")
+    }
 
     #[test]
     fn default_header_has_correct_magic() {
@@ -197,9 +238,9 @@ mod tests {
     #[test]
     fn encode_writes_header_fields_at_expected_offsets() {
         let header = DatabaseHeader {
-            magic: *b"PDB1",
-            version: 1,
-            page_size: 4096,
+            magic: MAGIC,
+            version: FORMAT_VERSION,
+            page_size: PAGE_SIZE as u16,
             page_count: 25,
             catalog_root: Some(PageId(3)),
         };
@@ -216,9 +257,9 @@ mod tests {
     #[test]
     fn encode_writes_zero_when_catalog_root_is_none() {
         let header = DatabaseHeader {
-            magic: *b"PDB1",
-            version: 1,
-            page_size: 4096,
+            magic: MAGIC,
+            version: FORMAT_VERSION,
+            page_size: PAGE_SIZE as u16,
             page_count: 1,
             catalog_root: None,
         };
@@ -231,20 +272,31 @@ mod tests {
     #[test]
     fn encode_writes_little_endian_values() {
         let header = DatabaseHeader {
-            magic: *b"PDB1",
-            version: 0x1234,
-            page_size: 0x5678,
+            magic: MAGIC,
+            version: FORMAT_VERSION,
+            page_size: PAGE_SIZE as u16,
             page_count: 0x0102_0304_0506_0708,
             catalog_root: Some(PageId(9)),
         };
 
         let page = header.encode().expect("header encoding should succeed");
 
-        assert_eq!(page.read(4, 2).unwrap(), [0x34, 0x12]);
-        assert_eq!(page.read(6, 2).unwrap(), [0x78, 0x56]);
+        // Version: 1
+        assert_eq!(page.read(4, 2).unwrap(), &[0x01, 0x00]);
+
+        // Page size: 4096 (0x1000)
+        assert_eq!(page.read(6, 2).unwrap(), &[0x00, 0x10]);
+
+        // Page count: 0x0102030405060708
         assert_eq!(
             page.read(8, 8).unwrap(),
-            [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
+        );
+
+        // Catalog root: PageId(9)
+        assert_eq!(
+            page.read(16, 8).unwrap(),
+            &[0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         );
     }
 
@@ -312,29 +364,21 @@ mod tests {
 
     #[test]
     fn decode_uses_little_endian_encoding() {
-        let mut page = Page::new();
+        let mut page = valid_header_page();
 
-        page.write(0, b"PDB1").unwrap();
-        page.write(4, &[0x02, 0x01]).unwrap();
-        page.write(6, &[0x00, 0x10]).unwrap();
+        let expected_count = 0x0102030405060708u64;
+
         page.write(8, &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01])
             .unwrap();
-        page.write(16, &5u64.to_le_bytes()).unwrap();
 
         let header = DatabaseHeader::decode(&page).unwrap();
 
-        assert_eq!(header.version, 0x0102);
-        assert_eq!(header.page_size, 4096);
-        assert_eq!(header.page_count, 0x0102030405060708);
-        assert_eq!(header.catalog_root, Some(PageId(5)));
+        assert_eq!(header.page_count, expected_count);
     }
 
     #[test]
     fn decode_zero_catalog_root_as_none() {
-        let mut page = Page::new();
-
-        page.write(16, &0u64.to_le_bytes()).unwrap();
-
+        let page = valid_header_page();
         let header = DatabaseHeader::decode(&page).unwrap();
 
         assert_eq!(header.catalog_root, None);
@@ -342,18 +386,20 @@ mod tests {
 
     #[test]
     fn decode_nonzero_catalog_root_as_page_id() {
-        let mut page = Page::new();
+        let mut page = valid_header_page();
 
-        page.write(16, &42u64.to_le_bytes()).unwrap();
+        // Allocate enough pages for PageId(3).
+        page.write(8, &4u64.to_le_bytes()).unwrap();
+        page.write(16, &3u64.to_le_bytes()).unwrap();
 
         let header = DatabaseHeader::decode(&page).unwrap();
 
-        assert_eq!(header.catalog_root, Some(PageId(42)));
+        assert_eq!(header.catalog_root, Some(PageId(3)));
     }
 
     #[test]
     fn decode_maximum_page_count() {
-        let mut page = Page::new();
+        let mut page = valid_header_page();
 
         page.write(8, &u64::MAX.to_le_bytes()).unwrap();
 
@@ -363,36 +409,39 @@ mod tests {
     }
 
     #[test]
-    fn decode_preserves_invalid_magic() {
-        let mut page = Page::new();
+    fn decode_rejects_invalid_magic() {
+        let mut page = valid_header_page();
 
         page.write(0, b"XXXX").unwrap();
 
-        let header = DatabaseHeader::decode(&page).unwrap();
-
-        assert_eq!(header.magic, *b"XXXX");
+        assert_eq!(
+            DatabaseHeader::decode(&page),
+            Err(HeaderError::InvalidMagic)
+        );
     }
 
     #[test]
-    fn decode_preserves_unsupported_version() {
-        let mut page = Page::new();
+    fn decode_rejects_unsupported_version() {
+        let mut page = valid_header_page();
 
         page.write(4, &99u16.to_le_bytes()).unwrap();
 
-        let header = DatabaseHeader::decode(&page).unwrap();
-
-        assert_eq!(header.version, 99);
+        assert_eq!(
+            DatabaseHeader::decode(&page),
+            Err(HeaderError::UnsupportedVersion { found: 99 })
+        );
     }
 
     #[test]
-    fn decode_preserves_invalid_page_size() {
-        let mut page = Page::new();
+    fn decode_rejects_invalid_page_size() {
+        let mut page = valid_header_page();
 
         page.write(6, &8192u16.to_le_bytes()).unwrap();
 
-        let header = DatabaseHeader::decode(&page).unwrap();
-
-        assert_eq!(header.page_size, 8192);
+        assert_eq!(
+            DatabaseHeader::decode(&page),
+            Err(HeaderError::InvalidPageSize { found: 8192 })
+        );
     }
 
     #[test]
